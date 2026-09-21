@@ -15,7 +15,7 @@ Validation:
    - Numerics are checked against the NumPy references in this file, via
      check_correct / check_correct_gqa. The same checks run two ways: on CPU
      through nki.simulate, which needs no device, and on a NeuronDevice by
-     calling the kernel directly. Both fp32 and bf16.
+     calling the kernel directly.
    - Validated on Trn2 during upstream review of #129, and on Inf2
      (NeuronCore-v2) by the on-device path added here.
    - benchmark_sweep() times the kernel end to end and reports achieved HBM
@@ -26,6 +26,10 @@ Validation:
    nki.simulate_kernel / nki.baremetal / nki.benchmark, which are gone; the
    neuronxcc.nki versions that remain cannot drive a top-level @nki.jit
    kernel.
+
+   Inputs are fp32. bf16 does not compile on NeuronCore-v2, because the
+   tensor engine requires an fp32 matmul destination there and nl.matmul
+   takes its destination dtype from the operands. See BF16_SUPPORTED.
 
    Run `python decode_attention.py` for the numeric checks (device auto-detected),
    or `python decode_attention.py --sweep` to add the bandwidth sweep.
@@ -371,6 +375,20 @@ PEAK_HBM_BYTES_S = 410e9
 # on _time_kernel about distinguishing HBM-bound from transfer-bound.
 PCIE_BYTES_S = 32e9
 
+# bf16 inputs do not compile on NeuronCore-v2 (gen2: inf2, trn1). nl.matmul
+# infers its PSUM destination dtype from the operands, and the tensor engine
+# rejects a non-fp32 matmul destination on gen2:
+#
+#   nc_matmul dst dtype must be float32 on gen2, got bfloat16
+#
+# Fixing it means replacing nl.matmul with an explicit fp32 PSUM tile plus
+# nisa.nc_matmul at all four matmul sites, and passing dtype=nl.float32 to
+# nl.transpose at the four transpose sites, since a transpose also runs on
+# the tensor engine. That is a change to the kernels rather than to this
+# harness, so it is left for a follow-up. gen3 (trn2) appears to accept a
+# bf16 destination, which is why upstream review on Trn2 never hit this.
+BF16_SUPPORTED = False
+
 
 def _itemsize(dtype):
     return np.dtype(dtype).itemsize
@@ -547,6 +565,19 @@ def _time_kernel(kernel, args, warmup=10, iters=100):
 # Correctness.
 # ---------------------------------------------------------------------
 
+def _bench_dtypes():
+    """Which input dtypes this host can actually run, and why if fewer."""
+    if not BF16_SUPPORTED:
+        print("note: bf16 skipped. nl.matmul cannot target a non-fp32 PSUM "
+              "destination on gen2 (inf2/trn1). See BF16_SUPPORTED.")
+    elif bfloat16 is None:
+        print("note: bf16 skipped, ml_dtypes not installed "
+              "(pip install ml_dtypes).")
+    else:
+        return [np.float32, bfloat16]
+    return [np.float32]
+
+
 def check_correct(backend="simulate", dtype=np.float32, d=128, seqlen_kv=128):
     """Milestone A: single head, single KV tile."""
     if backend == "benchmark":
@@ -589,11 +620,8 @@ def check_correct_gqa(backend="simulate", dtype=np.float32, d=128,
 
 
 def check_all(backend="simulate"):
-    """Both kernels, both dtypes."""
-    dtypes = [np.float32] + ([bfloat16] if bfloat16 is not None else [])
-    if bfloat16 is None:
-        print("note: ml_dtypes not installed, skipping bf16 checks "
-              "(pip install ml_dtypes)")
+    """Both kernels, every input dtype this host supports."""
+    dtypes = _bench_dtypes()
 
     results = []
     for dtype in dtypes:
@@ -717,7 +745,7 @@ def benchmark_sweep(warmup=10, iters=100, assert_perf=False):
             "uncalibrated. Run the sweep once without it and set them from "
             "the roofline_x column.")
 
-    dtypes = [np.float32] + ([bfloat16] if bfloat16 is not None else [])
+    dtypes = _bench_dtypes()
 
     print("\n=== Experiment 1: GQA isolation "
           "(n_q_heads=8, seqlen_kv=2048 fixed; n_kv_heads varies) ===")
