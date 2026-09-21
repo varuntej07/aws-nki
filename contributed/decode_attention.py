@@ -677,8 +677,11 @@ def _bench_row(meta, warmup, iters):
                                       dtype=meta["dtype"])
         kernel = decode_attention_gqa_fwd
 
-    # neff_name=None on purpose: a sweep with artifacts on would drop dozens
-    # of NEFF/NTFF files into the working directory.
+    # Compiling is the slow part of a sweep (every config is its own
+    # compilation), so say what is being worked on before starting it.
+    print(f"  ... compiling {meta['kernel']} N={meta['seqlen_kv']} "
+          f"Hq={meta['n_q_heads']} Hkv={meta['n_kv_heads']} "
+          f"{_dtype_name(meta['dtype'])}", flush=True)
     lat = _time_kernel(kernel, args, warmup=warmup, iters=iters)
 
     nbytes = _hbm_bytes(meta)
@@ -698,7 +701,8 @@ def _print_row(r):
           f"{_dtype_name(r['dtype']):<9s} "
           f"{r['p50_us']:<9.2f} {r['p99_us']:<9.2f} "
           f"{r['nbytes'] / 1024 ** 2:<8.2f} {r['gib_s']:<7.1f} "
-          f"{r['pct_peak']:<6.1f} {r['ai']:<6.2f} {r['roofline_x']:<.1f}")
+          f"{r['pct_peak']:<6.1f} {r['ai']:<6.2f} {r['roofline_x']:<.1f}",
+          flush=True)
     # grep-able duplicate: `... --sweep | grep ^CSV > results.csv`
     print(f"CSV,{r['kernel']},{r['d']},{r['seqlen_kv']},{r['n_q_heads']},"
           f"{r['n_kv_heads']},{r['group']},{_dtype_name(r['dtype'])},"
