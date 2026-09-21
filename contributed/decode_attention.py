@@ -18,10 +18,13 @@ Validation:
      calling the kernel directly.
    - Validated on Trn2 during upstream review of #129, and on Inf2
      (NeuronCore-v2) by the on-device path added here.
-   - There is no latency benchmark here. On NKI 0.6.0 the standalone path
-     recompiles on every call, so timing it measures the compiler rather than
-     the kernel. See the note above the harness for what the compile-once
-     route would require. Benchmarks belong in their own change.
+   - Device latency lives in decode_attention_benchmark.py, which compiles once
+     through the parser frontend and replays the NEFF via
+     CompiledKernel.benchmark(). Timing a plain kernel(*args) call instead
+     measures the compiler: on NKI 0.6.0 the standalone path re-runs the
+     frontend on every invocation, ~1.5 s per call on Inf2 against ~67 us of
+     kernel time at seqlen_kv=512. That file needs a device; the checks above
+     do not.
 
    Requires NKI 0.6.0 or newer (Neuron SDK 2.32+). Earlier releases exposed
    nki.simulate_kernel / nki.baremetal / nki.benchmark, which are gone; the
