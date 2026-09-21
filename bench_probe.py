@@ -103,21 +103,28 @@ def patch_dtype_size():
     return patched
 
 
-def patch_tileview_buffer():
-    """Give TileView the .buffer that nl.load() asserts on.
+def patch_tileview():
+    """Fill in the NkiTensor attribute surface that TileView is missing.
 
-    Under compile_kernel the inputs are TileViews, not NkiTensors. nl.load()
-    wants exactly three things from its source: .buffer, .shape and .dtype.
-    TileView has the last two. It knows where it lives as well, it just calls
-    it memspace and spells it MemSpace.SharedHbm, while is_hbm() matches on the
-    NAME of a MemoryRegion and so looks for "shared_hbm". One enum onto the
-    other and the assert passes for the right reason, not by being bypassed.
+    Under compile_kernel the inputs are TileViews, not NkiTensors, and the nl
+    ops reach for attributes TileView spells differently or lacks:
+
+      .buffer  nl.load() asserts is_hbm(src.buffer), and is_hbm matches on the
+               NAME of a MemoryRegion ("shared_hbm"). TileView knows where it
+               lives, it just calls it memspace and spells it SharedHbm. Map
+               the one enum onto the other so the assert passes because the
+               source really is in HBM, not because it was bypassed.
+      .size    nisa.dma_copy() asserts src.size == dst.size. Unambiguous:
+               the product of the shape, which TileView already has.
+
+    Each entry is a translation of something TileView genuinely knows. If a
+    future miss needs a value TileView does NOT know, stop: that is emulation,
+    not translation, and the measurement stops being trustworthy.
     """
+    import math
+
     import nki.language as nl
     from nki.compiler.kernel_builder.builder import MemSpace, TileView
-
-    if hasattr(TileView, "buffer"):
-        return "TileView.buffer already present, left alone"
 
     regions = {MemSpace.SharedHbm: nl.shared_hbm,
                MemSpace.Hbm: nl.private_hbm,
@@ -131,8 +138,16 @@ def patch_tileview_buffer():
             raise AttributeError(
                 f"no MemoryRegion mapped for memspace {self.memspace!r}")
 
-    TileView.buffer = property(buffer)
-    return f"TileView.buffer -> MemoryRegion for {len(regions)} memspaces"
+    def size(self):
+        return math.prod(self.shape)
+
+    added = []
+    for name, fn in (("buffer", buffer), ("size", size)):
+        if hasattr(TileView, name):
+            continue
+        setattr(TileView, name, property(fn))
+        added.append(name)
+    return f"TileView += {added}" if added else "TileView already complete"
 
 
 def annotate(func):
@@ -213,7 +228,7 @@ def show(r):
 
 def main():
     print("patched dtype_size in:", patch_dtype_size(), flush=True)
-    print("patched TileView:", patch_tileview_buffer(), flush=True)
+    print("patched TileView:", patch_tileview(), flush=True)
     print("Tensor:", annotate(K.func), flush=True)
 
     print("\n--- smoke test: one config ---", flush=True)
