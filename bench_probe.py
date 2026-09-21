@@ -1,11 +1,13 @@
 """Get real device latency. Temporary; delete before the PR.
 
 Strategy 1: compile_kernel() -> CompiledKernel.benchmark().
-  Blocked last time by `AssertionError: Unknown dtype: float32`, because the
-  builder hands the kernel a tracer tensor whose .dtype is a NUMPY dtype while
-  nki.language._dtypes.dtype_size() only knows NKI dtypes. That is a missing
-  table entry, not a wall, so normalise it here in the harness rather than
-  touching the kernel.
+  Blocked by `AssertionError: Unknown dtype: float32`. The dtype the builder
+  hands the kernel is neither an NKI dtype nor a numpy one: it is a backend
+  dtype object minted by nki._backends.mlir_tracer (repr `nb.float32`) that
+  merely stringifies as "float32", which is what made the assert message look
+  like a numpy dtype. _DTYPE_SIZES is keyed on the canonical nki.language
+  dtype objects by identity, so the tracer's object misses. Resolve it by
+  NAME here in the harness rather than touching the kernel.
 
 Strategy 2: if 1 still fails, dump the NEFF/NTFF and read device-side metrics
   out of the neuron-profile CLI, which is fully supported.
@@ -35,21 +37,61 @@ def hbm_bytes(meta):
     return s * d * (2 * meta["n_kv_heads"] * n + 2 * meta["n_q_heads"])
 
 
+# Widths numpy does not know by name.
+_NON_NUMPY_WIDTHS = {"bfloat16": 2, "float8_e4m3": 1, "float8_e5m2": 1,
+                     "float8e4m3": 1, "float8e5m2": 1,
+                     "float32r": 4, "tfloat32": 4}
+
+
 def patch_dtype_size():
-    """Teach dtype_size() about numpy dtypes.
+    """Teach dtype_size() about dtype objects it does not recognise by identity.
 
     tensor.py does `from ._dtypes import dtype_size`, so the name is bound in
     that module too. Patch every module that holds a reference.
     """
+    import nki.language as nl
     import nki.language._dtypes as D
 
     original = D.dtype_size
+    seen = set()
 
     def tolerant(t):
+        # 1. the real NKI table, unchanged.
+        first = None
         try:
             return original(t)
-        except Exception:
-            return np.dtype(t).itemsize          # numpy fallback
+        except Exception as exc:
+            first = exc          # `as` name is unbound once the block exits
+
+        name = str(t).rsplit(".", 1)[-1].strip()
+        if name not in seen:
+            seen.add(name)
+            print(f"[dtype_size] unrecognised: module={type(t).__module__} "
+                  f"type={type(t).__name__} str={str(t)!r} repr={t!r} "
+                  f"itemsize={getattr(t, 'itemsize', None)!r}", flush=True)
+
+        # 2. the object may carry its own width.
+        w = getattr(t, "itemsize", None)
+        if isinstance(w, int) and w > 0:
+            return w
+
+        # 3. same name, right identity: look the canonical NKI dtype back up.
+        canonical = getattr(nl, name, None)
+        if canonical is not None and canonical is not t:
+            try:
+                return original(canonical)
+            except Exception:
+                pass
+
+        # 4. numpy by name, then the names numpy does not know.
+        try:
+            return np.dtype(name).itemsize
+        except TypeError:
+            pass
+        if name in _NON_NUMPY_WIDTHS:
+            return _NON_NUMPY_WIDTHS[name]
+
+        raise first
 
     patched = []
     for name in ("nki.language._dtypes", "nki.language.tensor",
