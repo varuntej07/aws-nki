@@ -56,82 +56,36 @@ def kernel_inputs(args):
 
 
 def show_api():
-    """Print the machinery around compile_kernel_to_nir, so a miss self-explains."""
-    from nki.compiler.ncc_driver import CompileOptions
-    from nki.framework import compiled as FC
-
-    print("=== the route: compile_kernel_to_nir -> NirResult -> CompiledKernel ===")
-    for label, obj in (("compile_kernel_to_nir", getattr(FC, "compile_kernel_to_nir", None)),
-                       ("compile_to_bir", getattr(FC, "compile_to_bir", None)),
-                       ("run_from_bir", getattr(FC, "run_from_bir", None))):
-        print(f"\n  {label}:")
-        if obj is None:
-            print("    <missing>")
-            continue
-        try:
-            print("    signature:", inspect.signature(obj))
-        except Exception as e:
-            print("    signature unavailable:", e)
-
-    # compile_to_bir is where the IR context gets built; that is the part
-    # frontend.compile() wanted and we could not supply.
-    src_target = getattr(FC, "compile_to_bir", None)
-    if src_target is not None:
-        print("\n  source: compile_to_bir")
-        try:
-            for line in inspect.getsource(src_target).splitlines()[:70]:
-                print("   ", line)
-        except Exception as e:
-            print("    unavailable:", e)
-
-    NR = getattr(FC, "NirResult", None)
-    print("\n  NirResult:", NR)
-    if NR is not None:
-        print("    fields:", sorted(n for n in dir(NR) if not n.startswith("__")))
-
-    print("\n  CompileOptions fields:")
-    fields = getattr(CompileOptions, "__dataclass_fields__", {})
-    print("   ", sorted(fields) or inspect.signature(CompileOptions))
-
-
-def find_compiled_kernel(nir, verbose=False):
-    """Walk a NirResult for a CompiledKernel or a NEFF path, two levels deep."""
+    """Confirm the pieces exist before using them."""
+    from nki.compiler.frontend import ParserFrontend
     from nki.compiler.ncc_driver import CompiledKernel
 
-    seen = []
-    for name in sorted(n for n in dir(nir) if not n.startswith("__")):
-        try:
-            val = getattr(nir, name)
-        except Exception as e:
-            seen.append((name, f"<raised {type(e).__name__}: {e}>"))
-            continue
-        if callable(val) and not isinstance(val, CompiledKernel):
-            seen.append((name, f"<callable {type(val).__name__}>"))
-            continue
-        seen.append((name, repr(val)[:150]))
-        if isinstance(val, CompiledKernel):
-            print(f"  found CompiledKernel at nir.{name}")
-            return val
-        if isinstance(val, str) and val.endswith(".neff") and os.path.exists(val):
-            print(f"  found NEFF at nir.{name}: {val}")
-        for sub in sorted(n for n in dir(val) if not n.startswith("_")):
-            try:
-                inner = getattr(val, sub)
-            except Exception:
-                continue
-            if isinstance(inner, CompiledKernel):
-                print(f"  found CompiledKernel at nir.{name}.{sub}")
-                return inner
-    if verbose:
-        print("  NirResult contents:")
-        for name, val in seen:
-            print(f"    {name} = {val}")
-    return None
+    print("=== route: ParserFrontend.compile -> from_frontend -> benchmark ===")
+    print("  ParserFrontend:      ", ParserFrontend)
+    print("  nki_ir_context:      ", ir_context())
+    print("  from_frontend:       ", inspect.signature(CompiledKernel.from_frontend))
+    print("  benchmark:           ", inspect.signature(CompiledKernel.benchmark))
+    print("  kernel params:       ", list(inspect.signature(K.func).parameters))
+
+
+def ir_context():
+    """The context manager compile_to_bir uses.
+
+    nki_ir_context is not exported from nki.framework.compiled, but
+    compile_to_bir is defined against it, so take it from that function's own
+    globals rather than guessing which module owns it.
+    """
+    from nki.framework.compiled import compile_to_bir
+
+    factory = compile_to_bir.__globals__.get("nki_ir_context")
+    if factory is None:
+        raise RuntimeError("nki_ir_context not found in compile_to_bir's globals")
+    return factory
 
 
 def bench_one(seqlen_kv, n_q_heads, n_kv_heads, warmup=5, iters=50, verbose=False):
-    from nki.compiler.ncc_driver import CompileOptions
-    from nki.framework.compiled import compile_kernel_to_nir
+    from nki.compiler.frontend import ParserFrontend
+    from nki.compiler.ncc_driver import CompiledKernel, CompileOptions
 
     args, ref, meta = _make_gqa_inputs(seqlen_kv=seqlen_kv,
                                        n_q_heads=n_q_heads,
@@ -141,30 +95,45 @@ def bench_one(seqlen_kv, n_q_heads, n_kv_heads, warmup=5, iters=50, verbose=Fals
     if verbose:
         print("  inputs:", {k: getattr(v, "shape", v) for k, v in inputs.items()})
 
+    nki_ir_context = ir_context()
+
     with tempfile.TemporaryDirectory(prefix="nki_pf_") as wd:
         opts = CompileOptions(target="trn1", artifacts_dir=wd,
                               output_path=os.path.join(wd, "kernel.neff"))
 
-        t0 = time.time()
-        nir = compile_kernel_to_nir(K, inputs=inputs, compile_opts=opts)
-        frontend_s = time.time() - t0
-        if verbose:
-            print(f"  NirResult: {type(nir).__name__}")
+        # The MLIR module belongs to the context, so the neuronx-cc step has to
+        # happen while it is still open. This mirrors compile_to_bir exactly.
+        with nki_ir_context() as context:
+            t0 = time.time()
+            result = ParserFrontend().compile(
+                context,
+                K,
+                inputs=inputs,
+                target=opts.target,
+                lnc=opts.lnc,
+                artifacts_dir=opts.artifacts_dir,
+                output_names=None,
+                enable_device_dump=opts.enable_device_dump,
+                debug=opts.debug,
+                lower_dma_transpose=opts.lower_dma_transpose,
+            )
+            frontend_s = time.time() - t0
+            if verbose:
+                print(f"  CompilationResult: function_name="
+                      f"{result.function_name!r} mac_count={result.mac_count}")
 
-        t0 = time.time()
-        compiled = find_compiled_kernel(nir, verbose=verbose)
-        if compiled is None:
-            raise RuntimeError(
-                "no CompiledKernel reachable from NirResult; see the dump above")
-        compile_s = time.time() - t0
-        if verbose:
-            print(f"  CompiledKernel artifacts="
-                  f"{getattr(compiled, 'artifacts_dir', '?')}")
+            t0 = time.time()
+            compiled = CompiledKernel.from_frontend(result, opts,
+                                                    frontend_time=frontend_s)
+            compile_s = time.time() - t0
+            if verbose:
+                print(f"  CompiledKernel: {type(compiled).__name__} "
+                      f"neff={getattr(compiled, 'output_path', '?')}")
 
-        t0 = time.time()
-        res = compiled.benchmark(warmup=warmup, iterations=iters,
-                                 q=q_t, k=k_t, v=v_t)
-        wall = time.time() - t0
+            t0 = time.time()
+            res = compiled.benchmark(warmup=warmup, iterations=iters,
+                                     q=q_t, k=k_t, v=v_t)
+            wall = time.time() - t0
 
     nbytes = hbm_bytes(meta)
     lat = getattr(res, "latency", None) or 0.0
