@@ -73,12 +73,32 @@ def _ir_context():
     return factory
 
 
-def _peak_hbm_bw():
-    """Peak HBM bandwidth per core, from the SDK if it exposes it."""
+def _peak_hbm_bw(target="trn1"):
+    """Peak HBM bandwidth per core, preferring the SDK's own constant.
+
+    _PEAK_HBM_BW is keyed by target rather than being a single number, so pick
+    the entry for the target we compile for. Returns the source alongside the
+    value: the "% peak" column means something different if this number is
+    assumed rather than read, and the caller prints which it was.
+    """
     from nki.compiler.ncc_driver import CompiledKernel
 
     peak = getattr(CompiledKernel, "_PEAK_HBM_BW", None)
-    return (float(peak), "SDK") if peak else (_PEAK_HBM_FALLBACK, "assumed")
+    source = "SDK"
+    if isinstance(peak, dict):
+        match = next((v for k, v in peak.items()
+                      if str(k).lower() == target.lower()), None)
+        if match is None:
+            return _PEAK_HBM_FALLBACK, f"assumed, no SDK entry for {target!r}"
+        peak, source = match, f"SDK[{target}]"
+    try:
+        peak = float(peak)
+    except (TypeError, ValueError):
+        return _PEAK_HBM_FALLBACK, "assumed"
+    # Guard the units: the column is bytes/s. Anything this small is GB/s.
+    if 0 < peak < 1e6:
+        peak *= 1e9
+    return (peak, source) if peak > 0 else (_PEAK_HBM_FALLBACK, "assumed")
 
 
 def hbm_bytes(meta):
