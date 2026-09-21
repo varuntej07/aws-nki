@@ -14,12 +14,18 @@ Author: Varun (varuntej.dev@gmail.com)
 Validation:
    - Numerics are checked against the NumPy references in this file, via
      check_correct / check_correct_gqa. The same checks run two ways: on CPU
-     through nki.simulate_kernel, which needs no device, and on a Neuron
-     device through nki.baremetal. Both fp32 and bf16.
-   - Both kernels were also validated on Trn2 during upstream review.
-   - benchmark_sweep() measures latency with nki.benchmark and reports achieved
-     HBM bandwidth against the traffic model in _hbm_bytes(). Run it on your own
+     through nki.simulate, which needs no device, and on a NeuronDevice by
+     calling the kernel directly. Both fp32 and bf16.
+   - Validated on Trn2 during upstream review of #129, and on Inf2
+     (NeuronCore-v2) by the on-device path added here.
+   - benchmark_sweep() times the kernel end to end and reports achieved HBM
+     bandwidth against the traffic model in _hbm_bytes(). Run it on your own
      hardware rather than trusting numbers measured on someone else's.
+
+   Requires NKI 0.6.0 or newer (Neuron SDK 2.32+). Earlier releases exposed
+   nki.simulate_kernel / nki.baremetal / nki.benchmark, which are gone; the
+   neuronxcc.nki versions that remain cannot drive a top-level @nki.jit
+   kernel.
 
    Run `python decode_attention.py` for the numeric checks (device auto-detected),
    or `python decode_attention.py --sweep` to add the bandwidth sweep.
@@ -39,6 +45,7 @@ import argparse
 import math
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -335,21 +342,34 @@ def numpy_decode_gqa_reference(q, k_cache, v_cache, n_q_heads, n_kv_heads, scale
 # =====================================================================
 # Test harness.
 # =====================================================================
-# Three ways to run a kernel, and they are not interchangeable:
+# Two ways to run a kernel:
 #
-#   simulate   nki.simulate_kernel   CPU, no device. Real outputs. Slow.
-#   baremetal  nki.baremetal         Device. Real outputs. The numeric check.
-#   benchmark  nki.benchmark         Device. Latency only.
+#   simulate   nki.simulate(kernel)(*args)   CPU, no device. Real outputs. Slow.
+#   device     kernel(*args)                 NeuronDevice. Real outputs.
 #
-# The third one is the trap: nki.benchmark does not feed the real input values
-# through the NEFF, so whatever comes back is undefined. Latency comes from
-# benchmark, numbers come from baremetal, and the two cannot be one pass.
+# On NKI 0.6.0 a @nki.jit kernel called with numpy arrays "compiles and
+# executes standalone, without a framework" (nki.jit's own docstring), so a
+# plain call IS the on-device path. That is why nki.baremetal no longer
+# exists. nki.simulate_kernel is gone the same way, replaced by nki.simulate.
+#
+# Note for anyone porting older NKI samples: nki.baremetal, nki.benchmark and
+# nki.simulate_kernel still exist under the deprecated neuronxcc.nki
+# namespace, but they cannot drive a kernel decorated with the current
+# top-level @nki.jit. They raise AttributeError: 'Kernel' object has no
+# attribute 'grid', because they expect the older TraceKernel object.
 
-# Inferentia2 HBM bandwidth, per CHIP (inf2.xlarge has one chip).
-# nki.benchmark runs on a single NeuronCore-v2 and a chip has two, so a
-# single-core kernel may not be able to reach this. Treat "% of chip peak"
-# as a floor on how well we are doing, not as a utilization figure.
-PEAK_BW_GIB_S = 820.0
+# Peak HBM bandwidth per NeuronCore, bytes/sec. NeuronCore-v2 (inf2, trn1)
+# is 410e9; the value is taken from _PEAK_HBM_BW in the installed compiler
+# (nki/compiler/ncc_driver.py), which is the authoritative source.
+#
+# Note this is PER CORE, not per chip. An inf2.xlarge chip has two v2 cores
+# and AWS quotes 820 GB/s for the chip; a single-core kernel like this one
+# is bounded by half of that.
+PEAK_HBM_BYTES_S = 410e9
+
+# Rough PCIe host-to-device ceiling. Not a target, a tripwire: see the note
+# on _time_kernel about distinguishing HBM-bound from transfer-bound.
+PCIE_BYTES_S = 32e9
 
 
 def _itemsize(dtype):
@@ -446,13 +466,17 @@ def _hbm_bytes(meta):
     return s * d * (2 * meta["n_kv_heads"] * n + 2 * meta["n_q_heads"])
 
 
+def _bandwidth_bytes_s(total_bytes, latency_us):
+    return total_bytes / (latency_us * 1e-6)
+
+
 def _bandwidth_gib_s(total_bytes, latency_us):
-    return total_bytes / (latency_us * 1e-6) / (1024 ** 3)
+    return _bandwidth_bytes_s(total_bytes, latency_us) / (1024 ** 3)
 
 
 def _roofline_us(meta):
-    """Time this config would take if it ran at full chip bandwidth."""
-    return _hbm_bytes(meta) / (PEAK_BW_GIB_S * (1024 ** 3)) * 1e6
+    """Time this config would take at full per-core HBM bandwidth."""
+    return _hbm_bytes(meta) / PEAK_HBM_BYTES_S * 1e6
 
 
 def _arithmetic_intensity(meta):
@@ -474,26 +498,49 @@ def _run(kernel, args, backend="simulate"):
     through the NEFF, so there is deliberately no way to ask it for numbers.
     """
     if backend == "simulate":
-        return np.asarray(nki.simulate_kernel(kernel, *args))
+        return np.asarray(nki.simulate(kernel)(*args))
     if backend == "baremetal":
-        # No artifacts_dir: it errors if the directory is non-empty, and we
-        # have no use for the artifacts here.
-        return np.asarray(nki.baremetal()(kernel)(*args))
+        # A plain call is the on-device path on NKI 0.6.0. See the note at
+        # the top of this section.
+        return np.asarray(kernel(*args))
     raise ValueError(f"unknown backend: {backend!r}")
 
 
-def _latency_us(kernel, args, warmup=10, iters=100, neff_name=None):
-    """Benchmark kernel(*args) on device. Returns {50: us, 99: us}."""
-    # Decorate inside the call, not at module scope. n_q_heads, n_kv_heads and
-    # softmax_scale are compile-time constants, so every config is its own
-    # compilation and needs its own warmup.
-    bench = nki.benchmark(warmup=warmup, iters=iters,
-                          save_neff_name=neff_name)(kernel)
-    bench(*args)
-    nc = bench.benchmark_result.nc_latency
-    # Available percentiles are exactly [0, 1, 10, 25, 50, 90, 99, 100].
-    return {50: nc.get_latency_percentile(50),
-            99: nc.get_latency_percentile(99)}
+def _time_kernel(kernel, args, warmup=10, iters=100):
+    """Time kernel(*args) on device. Returns {50, 99, "min"} in microseconds.
+
+    Every iteration is timed separately, so we get the whole distribution and
+    can take real percentiles rather than just mean/min/max.
+
+    What this measures is end-to-end call latency: host-to-device transfer of
+    the inputs, execution, and device-to-host transfer of the output. NKI
+    0.6.0 exposes no supported way to get NEFF-only latency for a @nki.jit
+    kernel. CompiledKernel.benchmark() does exist, but it lives behind
+    nki.compiler.kernel_builder.builder, which is not re-exported from
+    nki.compiler and wants a plain function plus a CompileOptions. Depending
+    on that from a sample kernel would break on the next SDK bump, so this
+    reports the honest end-to-end number instead of the flattering one.
+
+    The consequence is a real hazard worth naming: if the inputs are
+    re-transferred over PCIe each call, these numbers describe PCIe and not
+    HBM. Checking for linear scaling in seqlen_kv does NOT catch that, since
+    PCIe transfer scales linearly too. benchmark_sweep compares the achieved
+    figure against PCIE_BYTES_S and says so if it lands in that territory.
+    """
+    # The first call compiles. Warmup absorbs that as well as any lazy
+    # device setup, so it is never inside a timed region.
+    for _ in range(warmup):
+        kernel(*args)
+
+    samples = np.empty(iters, dtype=np.float64)
+    for i in range(iters):
+        t0 = time.perf_counter()
+        kernel(*args)
+        samples[i] = (time.perf_counter() - t0) * 1e6
+
+    return {50: float(np.percentile(samples, 50)),
+            99: float(np.percentile(samples, 99)),
+            "min": float(samples.min())}
 
 
 # ---------------------------------------------------------------------
@@ -503,7 +550,7 @@ def _latency_us(kernel, args, warmup=10, iters=100, neff_name=None):
 def check_correct(backend="simulate", dtype=np.float32, d=128, seqlen_kv=128):
     """Milestone A: single head, single KV tile."""
     if backend == "benchmark":
-        raise ValueError("benchmark outputs are undefined; use simulate or baremetal")
+        raise ValueError("benchmark is not an execution backend; use simulate or baremetal")
 
     args, ref, _ = _make_mha_inputs(d=d, seqlen_kv=seqlen_kv, dtype=dtype)
     out = _run(decode_attention_fwd, args, backend=backend)
@@ -525,7 +572,7 @@ def check_correct_gqa(backend="simulate", dtype=np.float32, d=128,
     actually runs. group=4 makes it real GQA rather than the degenerate case.
     """
     if backend == "benchmark":
-        raise ValueError("benchmark outputs are undefined; use simulate or baremetal")
+        raise ValueError("benchmark is not an execution backend; use simulate or baremetal")
 
     args, ref, meta = _make_gqa_inputs(d=d, seqlen_kv=seqlen_kv,
                                        n_q_heads=n_q_heads, n_kv_heads=n_kv_heads,
@@ -573,20 +620,20 @@ ROOFLINE_SLACK = None
 FIXED_OVERHEAD_US = None
 
 
-def benchmark_kernel(save_artifacts=False):
+def benchmark_kernel():
     """The canonical single-config benchmark, in the shape the rest of
-    contributed/ uses. Saves NEFF/NTFF only when asked."""
+    contributed/ uses."""
     args, _, _ = _make_gqa_inputs(seqlen_kv=2048, n_q_heads=8, n_kv_heads=2)
-    lat = _latency_us(decode_attention_gqa_fwd, args, warmup=10, iters=100,
-                      neff_name="decode_attention.neff" if save_artifacts else None)
+    lat = _time_kernel(decode_attention_gqa_fwd, args, warmup=10, iters=100)
 
+    print(f"Latency (min): {lat['min']:.2f} us")
     print(f"Latency (P50): {lat[50]:.2f} us")
     print(f"Latency (P99): {lat[99]:.2f} us")
     return lat
 
 
 _COLS = ("kernel  d    N      Hq  Hkv  grp  dtype     "
-         "p50_us    p99_us    MiB      GiB/s   %chip  AI     roofline_x")
+         "p50_us    p99_us    MiB      GiB/s   %peak  AI     roofline_x")
 
 
 def _bench_row(meta, warmup, iters):
@@ -604,7 +651,7 @@ def _bench_row(meta, warmup, iters):
 
     # neff_name=None on purpose: a sweep with artifacts on would drop dozens
     # of NEFF/NTFF files into the working directory.
-    lat = _latency_us(kernel, args, warmup=warmup, iters=iters, neff_name=None)
+    lat = _time_kernel(kernel, args, warmup=warmup, iters=iters)
 
     nbytes = _hbm_bytes(meta)
     row = dict(meta)
@@ -612,7 +659,8 @@ def _bench_row(meta, warmup, iters):
                gib_s=_bandwidth_gib_s(nbytes, lat[50]),
                ai=_arithmetic_intensity(meta),
                roofline_x=lat[99] / _roofline_us(meta))
-    row["pct_chip"] = 100.0 * row["gib_s"] / PEAK_BW_GIB_S
+    row["bytes_s"] = _bandwidth_bytes_s(nbytes, lat[50])
+    row["pct_peak"] = 100.0 * row["bytes_s"] / PEAK_HBM_BYTES_S
     return row
 
 
@@ -622,12 +670,12 @@ def _print_row(r):
           f"{_dtype_name(r['dtype']):<9s} "
           f"{r['p50_us']:<9.2f} {r['p99_us']:<9.2f} "
           f"{r['nbytes'] / 1024 ** 2:<8.2f} {r['gib_s']:<7.1f} "
-          f"{r['pct_chip']:<6.1f} {r['ai']:<6.2f} {r['roofline_x']:<.1f}")
+          f"{r['pct_peak']:<6.1f} {r['ai']:<6.2f} {r['roofline_x']:<.1f}")
     # grep-able duplicate: `... --sweep | grep ^CSV > results.csv`
     print(f"CSV,{r['kernel']},{r['d']},{r['seqlen_kv']},{r['n_q_heads']},"
           f"{r['n_kv_heads']},{r['group']},{_dtype_name(r['dtype'])},"
           f"{r['p50_us']:.3f},{r['p99_us']:.3f},{r['nbytes']},"
-          f"{r['gib_s']:.3f},{r['pct_chip']:.3f},{r['ai']:.3f}")
+          f"{r['gib_s']:.3f},{r['pct_peak']:.3f},{r['ai']:.3f}")
 
 
 def _fit_overhead(rows):
@@ -698,7 +746,7 @@ def benchmark_sweep(warmup=10, iters=100, assert_perf=False):
         a, asymptotic = _fit_overhead(per_dtype)
         if a is not None:
             tail = (f"asymptotic BW {asymptotic:.1f} GiB/s "
-                    f"({100.0 * asymptotic / PEAK_BW_GIB_S:.1f}% of chip peak)"
+                    f"({100.0 * asymptotic * (1024 ** 3) / PEAK_HBM_BYTES_S:.1f}% of core peak)"
                     if asymptotic else "slope non-positive, refit needed")
             print(f"  fit[{_dtype_name(dtype)}]: fixed overhead {a:.2f} us, {tail}")
         exp2.extend(per_dtype)
@@ -713,12 +761,28 @@ def benchmark_sweep(warmup=10, iters=100, assert_perf=False):
         mha.append(r)
         _print_row(r)
 
-    print(f"\npeak reference: {PEAK_BW_GIB_S:.0f} GiB/s per Inferentia2 CHIP.")
-    print("nki.benchmark runs on ONE NeuronCore-v2 and a chip has two, so "
-          "%chip is a lower bound on utilization, not a utilization figure.")
-    print(f"warmup={warmup} iters={iters}; GiB/s is computed from p50.")
-
     rows = exp1 + exp2 + mha
+    best = max(r["bytes_s"] for r in rows)
+
+    print(f"\npeak reference: {PEAK_HBM_BYTES_S / 1e9:.0f} GB/s per "
+          f"NeuronCore-v2 ({PEAK_HBM_BYTES_S / 1024 ** 3:.0f} GiB/s). This kernel "
+          f"uses one core; an inf2 chip has two.")
+    print(f"warmup={warmup} iters={iters}; GiB/s is computed from p50.")
+    print("Latency is end-to-end per call: host-to-device transfer, execution, "
+          "device-to-host. It is not NEFF-only latency. See _time_kernel.")
+
+    # The tripwire. If the best figure across the whole sweep sits nearer PCIe
+    # speeds than HBM speeds, we are timing the bus, not the kernel, and every
+    # bandwidth number above describes the wrong thing. Checking that latency
+    # scales linearly with seqlen_kv does NOT catch this: PCIe transfer scales
+    # linearly too.
+    if best < PCIE_BYTES_S * 1.5:
+        print(f"\nWARNING: best achieved {best / 1e9:.1f} GB/s is within range "
+              f"of the ~{PCIE_BYTES_S / 1e9:.0f} GB/s PCIe ceiling and well under "
+              f"the {PEAK_HBM_BYTES_S / 1e9:.0f} GB/s HBM peak. These numbers may "
+              f"be bounded by host-device transfer rather than by HBM. Do not "
+              f"quote them as HBM bandwidth without checking.")
+
     if assert_perf:
         for r in rows:
             bound = ROOFLINE_SLACK * _roofline_us(r) + FIXED_OVERHEAD_US
@@ -748,8 +812,6 @@ def main(argv=None):
                         help="run the bandwidth sweep (requires a device)")
     parser.add_argument("--assert-perf", action="store_true",
                         help="fail if any config misses the calibrated roofline bound")
-    parser.add_argument("--save-artifacts", action="store_true",
-                        help="keep the NEFF/NTFF from benchmark_kernel()")
     args = parser.parse_args(argv)
 
     backend = args.backend or _auto_backend()
@@ -759,7 +821,7 @@ def main(argv=None):
         if backend != "baremetal":
             print("\n--sweep needs a Neuron device; skipping.")
         else:
-            benchmark_kernel(save_artifacts=args.save_artifacts)
+            benchmark_kernel()
             benchmark_sweep(assert_perf=args.assert_perf)
 
     return 0 if ok else 1
