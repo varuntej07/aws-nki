@@ -34,8 +34,20 @@ def main():
     print("shapes", q_t.shape, k_t.shape, v_t.shape)
     print("bytes per call", _hbm_bytes(meta))
 
+    from nki.compiler.kernel_builder import builder as B
     from nki.compiler.kernel_builder.builder import compile_kernel
     from nki.compiler.ncc_driver import CompileOptions
+
+    # compile_kernel insists every tensor parameter carries a `: Tensor`
+    # annotation. Rather than change the kernel signature before knowing this
+    # path works at all, annotate the function object in place. Annotations
+    # are inert for the normal @nki.jit call path.
+    Tensor = getattr(B, "Tensor", None)
+    if Tensor is None:
+        import nki.typing as nt
+        Tensor = nt.Tensor
+    print("Tensor type:", Tensor)
+    K.func.__annotations__ = {"q": Tensor, "k": Tensor, "v": Tensor}
 
     with tempfile.TemporaryDirectory(prefix="nki_bench_") as wd:
         opts = CompileOptions(
