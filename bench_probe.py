@@ -103,6 +103,38 @@ def patch_dtype_size():
     return patched
 
 
+def patch_tileview_buffer():
+    """Give TileView the .buffer that nl.load() asserts on.
+
+    Under compile_kernel the inputs are TileViews, not NkiTensors. nl.load()
+    wants exactly three things from its source: .buffer, .shape and .dtype.
+    TileView has the last two. It knows where it lives as well, it just calls
+    it memspace and spells it MemSpace.SharedHbm, while is_hbm() matches on the
+    NAME of a MemoryRegion and so looks for "shared_hbm". One enum onto the
+    other and the assert passes for the right reason, not by being bypassed.
+    """
+    import nki.language as nl
+    from nki.compiler.kernel_builder.builder import MemSpace, TileView
+
+    if hasattr(TileView, "buffer"):
+        return "TileView.buffer already present, left alone"
+
+    regions = {MemSpace.SharedHbm: nl.shared_hbm,
+               MemSpace.Hbm: nl.private_hbm,
+               MemSpace.Sbuf: nl.sbuf,
+               MemSpace.Psum: nl.psum}
+
+    def buffer(self):
+        try:
+            return regions[self.memspace]
+        except KeyError:
+            raise AttributeError(
+                f"no MemoryRegion mapped for memspace {self.memspace!r}")
+
+    TileView.buffer = property(buffer)
+    return f"TileView.buffer -> MemoryRegion for {len(regions)} memspaces"
+
+
 def annotate(func):
     from nki.compiler.kernel_builder import builder as B
     Tensor = getattr(B, "Tensor", None)
@@ -181,6 +213,7 @@ def show(r):
 
 def main():
     print("patched dtype_size in:", patch_dtype_size(), flush=True)
+    print("patched TileView:", patch_tileview_buffer(), flush=True)
     print("Tensor:", annotate(K.func), flush=True)
 
     print("\n--- smoke test: one config ---", flush=True)
