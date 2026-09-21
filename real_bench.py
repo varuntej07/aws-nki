@@ -49,103 +49,117 @@ def hbm_bytes(meta):
     return s * d * (2 * meta["n_kv_heads"] * n + 2 * meta["n_q_heads"])
 
 
-def show_api():
-    """Print what we are about to call, so a mismatch is self-explaining."""
-    from nki.compiler.frontend import NKIFrontend, ParserFrontend
-    from nki.compiler.ncc_driver import CompileOptions
+def kernel_inputs(args):
+    """The kernel's arguments keyed by name; compile() wants a dict, not a tuple."""
+    names = list(inspect.signature(K.func).parameters)
+    return dict(zip(names, args))
 
-    print("=== the call we are about to make ===")
-    print("  ParserFrontend.__init__:", inspect.signature(ParserFrontend.__init__))
-    print("  NKIFrontend.compile:    ", inspect.signature(NKIFrontend.compile))
-    doc = inspect.getdoc(NKIFrontend.compile)
-    if doc:
-        print("    " + "\n    ".join(doc.splitlines()[:20]))
-    try:
-        src = inspect.getsource(NKIFrontend.compile).splitlines()
-        print("\n  source:")
-        for line in src[:55]:
-            print("   ", line)
-    except Exception as e:
-        print("  source unavailable:", e)
+
+def show_api():
+    """Print the machinery around compile_kernel_to_nir, so a miss self-explains."""
+    from nki.compiler.ncc_driver import CompileOptions
+    from nki.framework import compiled as FC
+
+    print("=== the route: compile_kernel_to_nir -> NirResult -> CompiledKernel ===")
+    for label, obj in (("compile_kernel_to_nir", getattr(FC, "compile_kernel_to_nir", None)),
+                       ("compile_to_bir", getattr(FC, "compile_to_bir", None)),
+                       ("run_from_bir", getattr(FC, "run_from_bir", None))):
+        print(f"\n  {label}:")
+        if obj is None:
+            print("    <missing>")
+            continue
+        try:
+            print("    signature:", inspect.signature(obj))
+        except Exception as e:
+            print("    signature unavailable:", e)
+
+    # compile_to_bir is where the IR context gets built; that is the part
+    # frontend.compile() wanted and we could not supply.
+    src_target = getattr(FC, "compile_to_bir", None)
+    if src_target is not None:
+        print("\n  source: compile_to_bir")
+        try:
+            for line in inspect.getsource(src_target).splitlines()[:70]:
+                print("   ", line)
+        except Exception as e:
+            print("    unavailable:", e)
+
+    NR = getattr(FC, "NirResult", None)
+    print("\n  NirResult:", NR)
+    if NR is not None:
+        print("    fields:", sorted(n for n in dir(NR) if not n.startswith("__")))
 
     print("\n  CompileOptions fields:")
     fields = getattr(CompileOptions, "__dataclass_fields__", {})
-    for name, f in fields.items():
-        print(f"    {name}: {getattr(f, 'type', '?')}")
-    if not fields:
-        print("   ", inspect.signature(CompileOptions))
+    print("   ", sorted(fields) or inspect.signature(CompileOptions))
 
 
-def build_compile_call(frontend, kernel, kernel_args, artifacts_dir, target):
-    """Fill compile()'s parameters from its own signature, not from a guess."""
-    sig = inspect.signature(frontend.compile)
-    params = sig.parameters
-    kwargs = {}
-    positional = []
+def find_compiled_kernel(nir, verbose=False):
+    """Walk a NirResult for a CompiledKernel or a NEFF path, two levels deep."""
+    from nki.compiler.ncc_driver import CompiledKernel
 
-    known = {
-        "args": tuple(kernel_args),
-        "kwargs": {},
-        "target": target,
-        "artifacts_dir": artifacts_dir,
-        "lnc": 1,
-        "debug": False,
-        "dump_python_ast": False,
-        "lower_dma_transpose": False,
-        "output_names": None,
-    }
-
-    first = True
-    for name, p in params.items():
-        if name == "self":
+    seen = []
+    for name in sorted(n for n in dir(nir) if not n.startswith("__")):
+        try:
+            val = getattr(nir, name)
+        except Exception as e:
+            seen.append((name, f"<raised {type(e).__name__}: {e}>"))
             continue
-        if first and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) \
-                and name not in known:
-            positional.append(kernel)       # the kernel itself
-            first = False
+        if callable(val) and not isinstance(val, CompiledKernel):
+            seen.append((name, f"<callable {type(val).__name__}>"))
             continue
-        first = False
-        if name in known:
-            kwargs[name] = known[name]
-        elif p.default is p.empty and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
-            print(f"  !! compile() needs an unhandled required param: {name} ({p})")
-    if not positional:
-        positional.append(kernel)
-    print(f"  calling compile({', '.join(type(a).__name__ for a in positional)}, "
-          f"{', '.join(f'{k}=...' for k in kwargs)})")
-    return positional, kwargs
+        seen.append((name, repr(val)[:150]))
+        if isinstance(val, CompiledKernel):
+            print(f"  found CompiledKernel at nir.{name}")
+            return val
+        if isinstance(val, str) and val.endswith(".neff") and os.path.exists(val):
+            print(f"  found NEFF at nir.{name}: {val}")
+        for sub in sorted(n for n in dir(val) if not n.startswith("_")):
+            try:
+                inner = getattr(val, sub)
+            except Exception:
+                continue
+            if isinstance(inner, CompiledKernel):
+                print(f"  found CompiledKernel at nir.{name}.{sub}")
+                return inner
+    if verbose:
+        print("  NirResult contents:")
+        for name, val in seen:
+            print(f"    {name} = {val}")
+    return None
 
 
 def bench_one(seqlen_kv, n_q_heads, n_kv_heads, warmup=5, iters=50, verbose=False):
-    from nki.compiler.frontend import ParserFrontend
-    from nki.compiler.ncc_driver import CompiledKernel, CompileOptions
+    from nki.compiler.ncc_driver import CompileOptions
+    from nki.framework.compiled import compile_kernel_to_nir
 
     args, ref, meta = _make_gqa_inputs(seqlen_kv=seqlen_kv,
                                        n_q_heads=n_q_heads,
                                        n_kv_heads=n_kv_heads)
     q_t, k_t, v_t = args[0], args[1], args[2]
+    inputs = kernel_inputs(args)
+    if verbose:
+        print("  inputs:", {k: getattr(v, "shape", v) for k, v in inputs.items()})
 
     with tempfile.TemporaryDirectory(prefix="nki_pf_") as wd:
         opts = CompileOptions(target="trn1", artifacts_dir=wd,
                               output_path=os.path.join(wd, "kernel.neff"))
 
-        frontend = ParserFrontend()
-        pos, kw = build_compile_call(frontend, K, args, wd, "trn1")
-
         t0 = time.time()
-        result = frontend.compile(*pos, **kw)
+        nir = compile_kernel_to_nir(K, inputs=inputs, compile_opts=opts)
         frontend_s = time.time() - t0
         if verbose:
-            print(f"  CompilationResult: function_name={result.function_name!r} "
-                  f"mac_count={result.mac_count}")
+            print(f"  NirResult: {type(nir).__name__}")
 
         t0 = time.time()
-        compiled = CompiledKernel.from_frontend(result, opts,
-                                                frontend_time=frontend_s)
+        compiled = find_compiled_kernel(nir, verbose=verbose)
+        if compiled is None:
+            raise RuntimeError(
+                "no CompiledKernel reachable from NirResult; see the dump above")
         compile_s = time.time() - t0
         if verbose:
-            print(f"  CompiledKernel: {type(compiled).__name__} "
-                  f"artifacts={getattr(compiled, 'artifacts_dir', '?')}")
+            print(f"  CompiledKernel artifacts="
+                  f"{getattr(compiled, 'artifacts_dir', '?')}")
 
         t0 = time.time()
         res = compiled.benchmark(warmup=warmup, iterations=iters,
