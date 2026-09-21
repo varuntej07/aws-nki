@@ -18,9 +18,10 @@ Validation:
      calling the kernel directly.
    - Validated on Trn2 during upstream review of #129, and on Inf2
      (NeuronCore-v2) by the on-device path added here.
-   - benchmark_sweep() times the kernel end to end and reports achieved HBM
-     bandwidth against the traffic model in _hbm_bytes(). Run it on your own
-     hardware rather than trusting numbers measured on someone else's.
+   - There is no latency benchmark here. On NKI 0.6.0 the standalone path
+     recompiles on every call, so timing it measures the compiler rather than
+     the kernel. See the note above the harness for what the compile-once
+     route would require. Benchmarks belong in their own change.
 
    Requires NKI 0.6.0 or newer (Neuron SDK 2.32+). Earlier releases exposed
    nki.simulate_kernel / nki.baremetal / nki.benchmark, which are gone; the
@@ -31,8 +32,8 @@ Validation:
    tensor engine requires an fp32 matmul destination there and nl.matmul
    takes its destination dtype from the operands. See BF16_SUPPORTED.
 
-   Run `python decode_attention.py` for the numeric checks (device auto-detected),
-   or `python decode_attention.py --sweep` to add the bandwidth sweep.
+   Run `python decode_attention.py` for the numeric checks; the backend is
+   auto-detected, so it simulates on a machine with no Neuron device.
 
 WARNING: These kernels:
    - Have not been tested across all input configurations
@@ -49,7 +50,6 @@ import argparse
 import math
 import os
 import sys
-import time
 
 import numpy as np
 
@@ -361,19 +361,17 @@ def numpy_decode_gqa_reference(q, k_cache, v_cache, n_q_heads, n_kv_heads, scale
 # namespace, but they cannot drive a kernel decorated with the current
 # top-level @nki.jit. They raise AttributeError: 'Kernel' object has no
 # attribute 'grid', because they expect the older TraceKernel object.
-
-# Peak HBM bandwidth per NeuronCore, bytes/sec. NeuronCore-v2 (inf2, trn1)
-# is 410e9; the value is taken from _PEAK_HBM_BW in the installed compiler
-# (nki/compiler/ncc_driver.py), which is the authoritative source.
 #
-# Note this is PER CORE, not per chip. An inf2.xlarge chip has two v2 cores
-# and AWS quotes 820 GB/s for the chip; a single-core kernel like this one
-# is bounded by half of that.
-PEAK_HBM_BYTES_S = 410e9
-
-# Rough PCIe host-to-device ceiling. Not a target, a tripwire: see the note
-# on _time_kernel about distinguishing HBM-bound from transfer-bound.
-PCIE_BYTES_S = 32e9
+# There is deliberately no latency benchmark here. The standalone path
+# recompiles on every call: nki/framework/compiled.py passes enable_cache=False
+# to compile_kernel_to_nir, so timing kernel(*args) measures the compiler, not
+# the kernel. Measured this way a 1 MB decode step "takes" about two seconds.
+# The compile-once route (compile_kernel -> CompiledKernel.benchmark) exists in
+# nki/compiler/kernel_builder/builder.py but is not re-exported, requires
+# ': Tensor' annotations on the kernel signature, and passes tensors whose
+# .dtype is a numpy dtype rather than an NKI one, which this kernel's
+# `dtype=q.dtype` then rejects. Benchmarks are therefore a separate change,
+# not a silently wrong column in this one.
 
 # bf16 inputs do not compile on NeuronCore-v2 (gen2: inf2, trn1). nl.matmul
 # infers its PSUM destination dtype from the operands, and the tensor engine
@@ -390,10 +388,6 @@ PCIE_BYTES_S = 32e9
 BF16_SUPPORTED = False
 
 
-def _itemsize(dtype):
-    return np.dtype(dtype).itemsize
-
-
 def _dtype_name(dtype):
     return np.dtype(dtype).name
 
@@ -403,8 +397,8 @@ def _quantize(x, dtype):
 
     The kernel gets the low-precision values; the NumPy reference gets the
     *same* values widened back to fp32. That isolates what we actually want
-    to measure (kernel error given bf16 inputs) from NumPy's own bf16
-    arithmetic, which is a different question.
+    to measure (kernel error given low-precision inputs) from NumPy's own
+    low-precision arithmetic, which is a different question.
     """
     narrowed = x.astype(dtype)
     return narrowed, narrowed.astype(np.float32)
@@ -464,57 +458,8 @@ def _make_gqa_inputs(d=128, seqlen_kv=512, n_q_heads=8, n_kv_heads=2,
     return (q_t, k_t, v_t, n_q_heads, n_kv_heads, scale), ref, meta
 
 
-# ---------------------------------------------------------------------
-# Traffic model.
-# ---------------------------------------------------------------------
-# Counting only what the kernel's nl.load / nl.store actually touch:
-#
-#   K and V tiles   2 * n_kv_heads * seqlen_kv * d     loaded once per KV head,
-#                                                      NOT once per query head.
-#                                                      That reuse is the GQA win.
-#   q_group         n_q_heads * d
-#   output store    n_q_heads * d
-#
-# The q and output terms are noise for any realistic seqlen_kv; they are
-# included so the number is honest rather than convenient.
-
-def _hbm_bytes(meta):
-    s = _itemsize(meta["dtype"])
-    d, n = meta["d"], meta["seqlen_kv"]
-    return s * d * (2 * meta["n_kv_heads"] * n + 2 * meta["n_q_heads"])
-
-
-def _bandwidth_bytes_s(total_bytes, latency_us):
-    return total_bytes / (latency_us * 1e-6)
-
-
-def _bandwidth_gib_s(total_bytes, latency_us):
-    return _bandwidth_bytes_s(total_bytes, latency_us) / (1024 ** 3)
-
-
-def _roofline_us(meta):
-    """Time this config would take at full per-core HBM bandwidth."""
-    return _hbm_bytes(meta) / PEAK_HBM_BYTES_S * 1e6
-
-
-def _arithmetic_intensity(meta):
-    """FLOP per byte. QK and PV are 2*n_q_heads*seqlen_kv*d FLOPs each, and
-    bytes are dominated by 2*n_kv_heads*seqlen_kv*d*itemsize, so this reduces
-    to 2*group/itemsize. Raising `group` is the only lever the kernel has."""
-    return 2.0 * meta["group"] / _itemsize(meta["dtype"])
-
-
-# ---------------------------------------------------------------------
-# Backend dispatch.
-# ---------------------------------------------------------------------
-
 def _run(kernel, args, backend="simulate"):
-    """Run kernel(*args) and return its output as an ndarray.
-
-    Only the two backends that produce real outputs live here. Benchmarking is
-    a separate function on purpose: nki.benchmark does not feed the real inputs
-    through the NEFF, so there is deliberately no way to ask it for numbers.
-    """
+    """Run kernel(*args) and return its output as an ndarray."""
     if backend == "simulate":
         return np.asarray(nki.simulate(kernel)(*args))
     if backend == "baremetal":
@@ -524,48 +469,7 @@ def _run(kernel, args, backend="simulate"):
     raise ValueError(f"unknown backend: {backend!r}")
 
 
-def _time_kernel(kernel, args, warmup=10, iters=100):
-    """Time kernel(*args) on device. Returns {50, 99, "min"} in microseconds.
-
-    Every iteration is timed separately, so we get the whole distribution and
-    can take real percentiles rather than just mean/min/max.
-
-    What this measures is end-to-end call latency: host-to-device transfer of
-    the inputs, execution, and device-to-host transfer of the output. NKI
-    0.6.0 exposes no supported way to get NEFF-only latency for a @nki.jit
-    kernel. CompiledKernel.benchmark() does exist, but it lives behind
-    nki.compiler.kernel_builder.builder, which is not re-exported from
-    nki.compiler and wants a plain function plus a CompileOptions. Depending
-    on that from a sample kernel would break on the next SDK bump, so this
-    reports the honest end-to-end number instead of the flattering one.
-
-    The consequence is a real hazard worth naming: if the inputs are
-    re-transferred over PCIe each call, these numbers describe PCIe and not
-    HBM. Checking for linear scaling in seqlen_kv does NOT catch that, since
-    PCIe transfer scales linearly too. benchmark_sweep compares the achieved
-    figure against PCIE_BYTES_S and says so if it lands in that territory.
-    """
-    # The first call compiles. Warmup absorbs that as well as any lazy
-    # device setup, so it is never inside a timed region.
-    for _ in range(warmup):
-        kernel(*args)
-
-    samples = np.empty(iters, dtype=np.float64)
-    for i in range(iters):
-        t0 = time.perf_counter()
-        kernel(*args)
-        samples[i] = (time.perf_counter() - t0) * 1e6
-
-    return {50: float(np.percentile(samples, 50)),
-            99: float(np.percentile(samples, 99)),
-            "min": float(samples.min())}
-
-
-# ---------------------------------------------------------------------
-# Correctness.
-# ---------------------------------------------------------------------
-
-def _bench_dtypes():
+def _check_dtypes():
     """Which input dtypes this host can actually run, and why if fewer."""
     if not BF16_SUPPORTED:
         print("note: bf16 skipped. nl.matmul cannot target a non-fp32 PSUM "
@@ -580,9 +484,6 @@ def _bench_dtypes():
 
 def check_correct(backend="simulate", dtype=np.float32, d=128, seqlen_kv=128):
     """Milestone A: single head, single KV tile."""
-    if backend == "benchmark":
-        raise ValueError("benchmark is not an execution backend; use simulate or baremetal")
-
     args, ref, _ = _make_mha_inputs(d=d, seqlen_kv=seqlen_kv, dtype=dtype)
     out = _run(decode_attention_fwd, args, backend=backend)
     out = out.reshape(-1).astype(np.float32)                       # (d,)
@@ -602,9 +503,6 @@ def check_correct_gqa(backend="simulate", dtype=np.float32, d=128,
     seqlen_kv=512 is four TILE_KV tiles, so the online-softmax rescale path
     actually runs. group=4 makes it real GQA rather than the degenerate case.
     """
-    if backend == "benchmark":
-        raise ValueError("benchmark is not an execution backend; use simulate or baremetal")
-
     args, ref, meta = _make_gqa_inputs(d=d, seqlen_kv=seqlen_kv,
                                        n_q_heads=n_q_heads, n_kv_heads=n_kv_heads,
                                        dtype=dtype)
@@ -621,209 +519,13 @@ def check_correct_gqa(backend="simulate", dtype=np.float32, d=128,
 
 def check_all(backend="simulate"):
     """Both kernels, every input dtype this host supports."""
-    dtypes = _bench_dtypes()
-
     results = []
-    for dtype in dtypes:
+    for dtype in _check_dtypes():
         results.append(check_correct(backend=backend, dtype=dtype))
         results.append(check_correct_gqa(backend=backend, dtype=dtype))
 
     print(f"\n{sum(results)}/{len(results)} checks passed")
     return all(results)
-
-
-# ---------------------------------------------------------------------
-# Performance.
-# ---------------------------------------------------------------------
-
-# Calibrated bound for the optional regression assertion. The multiplicative
-# term tracks the traffic model so one constant covers every sweep point; the
-# additive term keeps short sequences, which are launch-bound rather than
-# bandwidth-bound, from tripping it.
-#
-# TODO: set these from the first real hardware run (benchmark_sweep prints a
-# roofline_x column for exactly this), and record instance type + SDK version
-# + date here. Until then assert_perf stays off.
-ROOFLINE_SLACK = None
-FIXED_OVERHEAD_US = None
-
-
-def benchmark_kernel():
-    """The canonical single-config benchmark, in the shape the rest of
-    contributed/ uses."""
-    args, _, _ = _make_gqa_inputs(seqlen_kv=2048, n_q_heads=8, n_kv_heads=2)
-    lat = _time_kernel(decode_attention_gqa_fwd, args, warmup=10, iters=100)
-
-    print(f"Latency (min): {lat['min']:.2f} us")
-    print(f"Latency (P50): {lat[50]:.2f} us")
-    print(f"Latency (P99): {lat[99]:.2f} us")
-    return lat
-
-
-_COLS = ("kernel  d    N      Hq  Hkv  grp  dtype     "
-         "p50_us    p99_us    MiB      GiB/s   %peak  AI     roofline_x")
-
-
-def _bench_row(meta, warmup, iters):
-    """Benchmark one config and return a row dict."""
-    if meta["kernel"] == "mha":
-        args, _, _ = _make_mha_inputs(d=meta["d"], seqlen_kv=meta["seqlen_kv"],
-                                      dtype=meta["dtype"])
-        kernel = decode_attention_fwd
-    else:
-        args, _, _ = _make_gqa_inputs(d=meta["d"], seqlen_kv=meta["seqlen_kv"],
-                                      n_q_heads=meta["n_q_heads"],
-                                      n_kv_heads=meta["n_kv_heads"],
-                                      dtype=meta["dtype"])
-        kernel = decode_attention_gqa_fwd
-
-    # Compiling is the slow part of a sweep (every config is its own
-    # compilation), so say what is being worked on before starting it.
-    print(f"  ... compiling {meta['kernel']} N={meta['seqlen_kv']} "
-          f"Hq={meta['n_q_heads']} Hkv={meta['n_kv_heads']} "
-          f"{_dtype_name(meta['dtype'])}", flush=True)
-    lat = _time_kernel(kernel, args, warmup=warmup, iters=iters)
-
-    nbytes = _hbm_bytes(meta)
-    row = dict(meta)
-    row.update(p50_us=lat[50], p99_us=lat[99], nbytes=nbytes,
-               gib_s=_bandwidth_gib_s(nbytes, lat[50]),
-               ai=_arithmetic_intensity(meta),
-               roofline_x=lat[99] / _roofline_us(meta))
-    row["bytes_s"] = _bandwidth_bytes_s(nbytes, lat[50])
-    row["pct_peak"] = 100.0 * row["bytes_s"] / PEAK_HBM_BYTES_S
-    return row
-
-
-def _print_row(r):
-    print(f"{r['kernel']:<7s} {r['d']:<4d} {r['seqlen_kv']:<6d} "
-          f"{r['n_q_heads']:<3d} {r['n_kv_heads']:<4d} {r['group']:<4d} "
-          f"{_dtype_name(r['dtype']):<9s} "
-          f"{r['p50_us']:<9.2f} {r['p99_us']:<9.2f} "
-          f"{r['nbytes'] / 1024 ** 2:<8.2f} {r['gib_s']:<7.1f} "
-          f"{r['pct_peak']:<6.1f} {r['ai']:<6.2f} {r['roofline_x']:<.1f}",
-          flush=True)
-    # grep-able duplicate: `... --sweep | grep ^CSV > results.csv`
-    print(f"CSV,{r['kernel']},{r['d']},{r['seqlen_kv']},{r['n_q_heads']},"
-          f"{r['n_kv_heads']},{r['group']},{_dtype_name(r['dtype'])},"
-          f"{r['p50_us']:.3f},{r['p99_us']:.3f},{r['nbytes']},"
-          f"{r['gib_s']:.3f},{r['pct_peak']:.3f},{r['ai']:.3f}")
-
-
-def _fit_overhead(rows):
-    """Fit latency_us(N) = a + b*N over one config's length sweep.
-
-    `a` is the fixed launch/sync floor. `b` gives the asymptotic bandwidth with
-    that floor removed, which is the number that answers "how close to the roof
-    are we". The short-sequence points are almost pure overhead, so their raw
-    GiB/s figure means nothing on its own.
-    """
-    if len(rows) < 2:
-        return None, None
-    ns = np.array([r["seqlen_kv"] for r in rows], dtype=np.float64)
-    us = np.array([r["p50_us"] for r in rows], dtype=np.float64)
-    b, a = np.polyfit(ns, us, 1)
-    if b <= 0:
-        return a, None
-    cfg = rows[0]
-    # K and V, one element each per token per KV head.
-    bytes_per_token = _itemsize(cfg["dtype"]) * cfg["d"] * 2 * cfg["n_kv_heads"]
-    return a, _bandwidth_gib_s(bytes_per_token, b)
-
-
-def benchmark_sweep(warmup=10, iters=100, assert_perf=False):
-    """Two experiments, deliberately separated.
-
-    Experiment 1 isolates the GQA effect: n_q_heads and seqlen_kv are pinned,
-    so FLOPs and output size are constant while K/V bytes fall 8x. If latency
-    tracks bytes rather than FLOPs, the shared K/V loads are real.
-
-    Experiment 2 scales seqlen_kv. The tile loop is nl.sequential_range, so
-    latency should grow linearly with the tile count. Departure from linear is
-    what would motivate split-KV.
-    """
-    # Check calibration before burning a few dozen compilations, not after.
-    if assert_perf and (ROOFLINE_SLACK is None or FIXED_OVERHEAD_US is None):
-        raise RuntimeError(
-            "assert_perf=True but ROOFLINE_SLACK / FIXED_OVERHEAD_US are "
-            "uncalibrated. Run the sweep once without it and set them from "
-            "the roofline_x column.")
-
-    dtypes = _bench_dtypes()
-
-    print("\n=== Experiment 1: GQA isolation "
-          "(n_q_heads=8, seqlen_kv=2048 fixed; n_kv_heads varies) ===")
-    print(_COLS)
-    exp1 = []
-    for dtype in dtypes:
-        for n_kv in (8, 4, 2, 1):
-            meta = dict(kernel="gqa", d=128, seqlen_kv=2048, n_q_heads=8,
-                        n_kv_heads=n_kv, group=8 // n_kv, dtype=dtype)
-            r = _bench_row(meta, warmup, iters)
-            exp1.append(r)
-            _print_row(r)
-
-    print("\n=== Experiment 2: length scaling "
-          "(n_q_heads=8, n_kv_heads=2 fixed; seqlen_kv varies) ===")
-    print(_COLS)
-    exp2 = []
-    for dtype in dtypes:
-        per_dtype = []
-        for n in (128, 512, 1024, 2048, 4096, 8192):
-            meta = dict(kernel="gqa", d=128, seqlen_kv=n, n_q_heads=8,
-                        n_kv_heads=2, group=4, dtype=dtype)
-            r = _bench_row(meta, warmup, iters)
-            per_dtype.append(r)
-            _print_row(r)
-        a, asymptotic = _fit_overhead(per_dtype)
-        if a is not None:
-            tail = (f"asymptotic BW {asymptotic:.1f} GiB/s "
-                    f"({100.0 * asymptotic * (1024 ** 3) / PEAK_HBM_BYTES_S:.1f}% of core peak)"
-                    if asymptotic else "slope non-positive, refit needed")
-            print(f"  fit[{_dtype_name(dtype)}]: fixed overhead {a:.2f} us, {tail}")
-        exp2.extend(per_dtype)
-
-    print("\n=== Milestone A (single tile, seqlen_kv=128) ===")
-    print(_COLS)
-    mha = []
-    for dtype in dtypes:
-        meta = dict(kernel="mha", d=128, seqlen_kv=128, n_q_heads=1,
-                    n_kv_heads=1, group=1, dtype=dtype)
-        r = _bench_row(meta, warmup, iters)
-        mha.append(r)
-        _print_row(r)
-
-    rows = exp1 + exp2 + mha
-    best = max(r["bytes_s"] for r in rows)
-
-    print(f"\npeak reference: {PEAK_HBM_BYTES_S / 1e9:.0f} GB/s per "
-          f"NeuronCore-v2 ({PEAK_HBM_BYTES_S / 1024 ** 3:.0f} GiB/s). This kernel "
-          f"uses one core; an inf2 chip has two.")
-    print(f"warmup={warmup} iters={iters}; GiB/s is computed from p50.")
-    print("Latency is end-to-end per call: host-to-device transfer, execution, "
-          "device-to-host. It is not NEFF-only latency. See _time_kernel.")
-
-    # The tripwire. If the best figure across the whole sweep sits nearer PCIe
-    # speeds than HBM speeds, we are timing the bus, not the kernel, and every
-    # bandwidth number above describes the wrong thing. Checking that latency
-    # scales linearly with seqlen_kv does NOT catch this: PCIe transfer scales
-    # linearly too.
-    if best < PCIE_BYTES_S * 1.5:
-        print(f"\nWARNING: best achieved {best / 1e9:.1f} GB/s is within range "
-              f"of the ~{PCIE_BYTES_S / 1e9:.0f} GB/s PCIe ceiling and well under "
-              f"the {PEAK_HBM_BYTES_S / 1e9:.0f} GB/s HBM peak. These numbers may "
-              f"be bounded by host-device transfer rather than by HBM. Do not "
-              f"quote them as HBM bandwidth without checking.")
-
-    if assert_perf:
-        for r in rows:
-            bound = ROOFLINE_SLACK * _roofline_us(r) + FIXED_OVERHEAD_US
-            assert r["p99_us"] <= bound, (
-                f"p99 {r['p99_us']:.2f}us exceeds {bound:.2f}us for "
-                f"N={r['seqlen_kv']} Hkv={r['n_kv_heads']} "
-                f"{_dtype_name(r['dtype'])}")
-        print(f"perf assertion passed on all {len(rows)} configs")
-    return rows
 
 
 # =====================================================================
@@ -836,27 +538,13 @@ def _auto_backend():
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Decode (flash-decoding) attention kernels: checks and benchmarks.")
+        description="Decode (flash-decoding) attention kernels: correctness checks.")
     parser.add_argument("--backend", choices=("simulate", "baremetal"),
                         default=None,
                         help="default: baremetal if a Neuron device is present")
-    parser.add_argument("--sweep", action="store_true",
-                        help="run the bandwidth sweep (requires a device)")
-    parser.add_argument("--assert-perf", action="store_true",
-                        help="fail if any config misses the calibrated roofline bound")
     args = parser.parse_args(argv)
 
-    backend = args.backend or _auto_backend()
-    ok = check_all(backend=backend)
-
-    if args.sweep:
-        if backend != "baremetal":
-            print("\n--sweep needs a Neuron device; skipping.")
-        else:
-            benchmark_kernel()
-            benchmark_sweep(assert_perf=args.assert_perf)
-
-    return 0 if ok else 1
+    return 0 if check_all(backend=args.backend or _auto_backend()) else 1
 
 
 if __name__ == "__main__":
